@@ -685,7 +685,11 @@ class Selector:
         changed_text = " ".join(ap.new_lines[n - 1] for n, _, _ in ap.added)
         old_lines = old_text.split("\n")
         changed_text += " " + " ".join(old_lines[L - 1] for L in ap.removed if L - 1 < len(old_lines))
-        if not any(tok in changed_text for tok in (" is ", "==", "!=", '"""', "'''", "#")):
+        # also worth a look: whitespace-only rewrites (same tokens once spaces are removed)
+        old_blob = "".join("".join(old_lines[L - 1].split()) for L in ap.removed if L - 1 < len(old_lines))
+        new_blob = "".join("".join(ap.new_lines[n - 1].split()) for n, _, _ in ap.added)
+        whitespace_only = old_blob == new_blob and bool(ap.removed) and bool(ap.added)
+        if not whitespace_only and not any(tok in changed_text for tok in (" is ", "==", "!=", '"""', "'''", "#")):
             return set(), set()
         try:
             old_tree = ast.parse(old_text)
