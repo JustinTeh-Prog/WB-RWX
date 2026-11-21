@@ -1,0 +1,10 @@
+__pycache__/
+*.pyc
+.venv/
+out/
+output*/
+*.parquet
+*.log
+.DS_Store
+target/
+data/
