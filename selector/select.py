@@ -19,6 +19,9 @@ INDEX_PATH = os.environ.get("INDEX_PATH", os.path.join(os.path.dirname(os.path.a
 WORKER_MS = 2000
 MAX_WORKERS = 8
 DEFUSE = os.environ.get("SEL_DEFUSE", "1") == "1"
+EQUIV = os.environ.get("SEL_EQUIV", "1") == "1"
+import re
+STRUCTURAL = re.compile(r"\s*(else\b|elif\b|except\b|finally\b|try\b|case\b|[)\]}]|with\b|for\b|while\b|if\b)")
 
 K_NONE, K_MODULE, K_CLASS, K_FUNC, K_DEF, K_DOC, K_TC = 0, 1, 2, 3, 4, 5, 6
 
@@ -34,6 +37,12 @@ class Index:
         self.sets = d["sets"]
         self.files = d["files"]
         self.attr_uses = d.get("attr_uses", {})
+        self.attr_uses_all = d.get("attr_uses_all", self.attr_uses)
+        self.quses = d.get("quses", {})
+        self.test_uses = d.get("test_uses", {})
+        self.inst = d.get("inst", {})
+        self.subs = d.get("subs", {})
+        self.plain_enums = set(d.get("plain_enums", []))
         self.dir_readers = d["dir_readers"]
         self.all_mask = self.sets[d["all"]]
         self.ntests = d["ntests"]
@@ -189,11 +198,11 @@ class NewTree:
         t = node.test
         return (isinstance(t, ast.Name) and t.id == "TYPE_CHECKING") or (isinstance(t, ast.Attribute) and t.attr == "TYPE_CHECKING")
 
-    def _walk(self, body, owner_func, block_owner, qual, ctx):
-        # ctx: "module" | "class" | "func"
+    def _walk(self, body, owner_func, block_owner, qual, ctx, hdr=None):
+        # ctx: "module" | "class" | "func"; hdr: line whose execution implies this block was entered
         for idx, st in enumerate(body):
             s, e = st.lineno, st.end_lineno
-            rec = {"start": s, "end": e, "node": st, "block": body, "idx": idx, "owner": block_owner, "func": owner_func, "ctx": ctx}
+            rec = {"start": s, "end": e, "node": st, "block": body, "idx": idx, "owner": block_owner, "func": owner_func, "ctx": ctx, "qual": qual, "hdr": hdr}
             if isinstance(st, (ast.FunctionDef, ast.AsyncFunctionDef)):
                 name = f"{qual}.{st.name}" if qual else st.name
                 ds = min([d.lineno for d in st.decorator_list] + [s])
@@ -204,7 +213,7 @@ class NewTree:
                 for ln in range(ds, bs):
                     self.line_stmt.setdefault(ln, rec)
                 self._doc(st.body)
-                self._walk(st.body, (name, ds, e, st), st, name, "func")
+                self._walk(st.body, (name, ds, e, st), st, name, "func", None)
             elif isinstance(st, ast.ClassDef):
                 name = f"{qual}.{st.name}" if qual else st.name
                 ds = min([d.lineno for d in st.decorator_list] + [s])
@@ -214,7 +223,7 @@ class NewTree:
                     if ctx == "module": self.module_lines.add(ln)
                     elif ctx == "class": self.class_lines.add(ln)
                 self._doc(st.body)
-                self._walk(st.body, owner_func, st, name, "class" if ctx != "func" else "func")
+                self._walk(st.body, owner_func, st, name, "class" if ctx != "func" else "func", None)
             elif isinstance(st, (ast.If, ast.For, ast.AsyncFor, ast.While, ast.With, ast.AsyncWith, ast.Try, ast.TryStar, ast.Match)):
                 self.line_stmt.setdefault(s, rec)
                 if ctx == "module": self.module_lines.add(s)
@@ -226,13 +235,13 @@ class NewTree:
                         if tc and field == "body":
                             for ln in range(sub[0].lineno, sub[-1].end_lineno + 1):
                                 self.tc_lines.add(ln)
-                        self._walk(sub, owner_func, st, qual, ctx)
+                        self._walk(sub, owner_func, st, qual, ctx, s)
                 for hnd in getattr(st, "handlers", []) or []:
                     self.line_stmt.setdefault(hnd.lineno, rec)
-                    self._walk(hnd.body, owner_func, st, qual, ctx)
+                    self._walk(hnd.body, owner_func, st, qual, ctx, hnd.lineno)
                 for c in getattr(st, "cases", []) or []:
                     self.line_stmt.setdefault(c.pattern.lineno, rec)
-                    self._walk(c.body, owner_func, st, qual, ctx)
+                    self._walk(c.body, owner_func, st, qual, ctx, c.pattern.lineno)
             else:
                 for ln in range(s, e + 1):
                     self.line_stmt.setdefault(ln, rec)
@@ -258,12 +267,103 @@ class NewTree:
         self._doc(tree.body)
 
 
+# ----------------------------------------------------------------------------- semantic normalization
+class _Normalize(ast.NodeTransformer):
+    """Rewrites comparisons whose `is`/`==` spelling cannot change behavior:
+    `x is None` -> `x == None` (object identity is what `== None` falls back to unless a type
+    overrides __eq__ to accept None), and `x is E.M` -> `x == E.M` for members of plain Enum
+    classes (Enum does not define __eq__, so == is identity). Docstrings are dropped."""
+
+    def __init__(self, plain_enums):
+        self.plain_enums = plain_enums
+
+    def _identity_like(self, node):
+        if isinstance(node, ast.Constant) and node.value is None:
+            return True
+        if isinstance(node, ast.Attribute):
+            base = node.value
+            name = base.id if isinstance(base, ast.Name) else (base.attr if isinstance(base, ast.Attribute) else None)
+            return name in self.plain_enums
+        return False
+
+    def visit_Compare(self, node):
+        self.generic_visit(node)
+        if len(node.ops) == 1 and isinstance(node.ops[0], (ast.Is, ast.IsNot)):
+            if self._identity_like(node.comparators[0]) or self._identity_like(node.left):
+                node.ops = [ast.Eq() if isinstance(node.ops[0], ast.Is) else ast.NotEq()]
+        return node
+
+    def _strip_doc(self, body):
+        if body and isinstance(body[0], ast.Expr) and isinstance(body[0].value, ast.Constant) and isinstance(body[0].value.value, str):
+            return body[1:] or [ast.Pass()]
+        return body
+
+    def visit_FunctionDef(self, node):
+        self.generic_visit(node)
+        node.body = self._strip_doc(node.body)
+        return node
+
+    visit_AsyncFunctionDef = visit_FunctionDef
+
+    def visit_ClassDef(self, node):
+        self.generic_visit(node)
+        node.body = self._strip_doc(node.body)
+        return node
+
+
+def norm_dump(node, plain_enums):
+    import copy
+    return ast.dump(_Normalize(plain_enums).visit(copy.deepcopy(node)), include_attributes=False)
+
+
+def find_func(tree, qualname):
+    """Innermost function node with this dotted qualname (functions and classes form the path)."""
+    parts = qualname.split(".")
+
+    def walk(body, i):
+        for st in body:
+            if isinstance(st, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)) and st.name == parts[i]:
+                if i == len(parts) - 1:
+                    return st
+                r = walk(st.body, i + 1)
+                if r is not None:
+                    return r
+            elif isinstance(st, (ast.If, ast.For, ast.While, ast.With, ast.Try, ast.AsyncFor, ast.AsyncWith, ast.TryStar)):
+                for field in ("body", "orelse", "finalbody"):
+                    sub = getattr(st, field, None)
+                    if sub:
+                        r = walk(sub, i)
+                        if r is not None:
+                            return r
+        return None
+
+    return walk(tree.body, 0)
+
+
 # ----------------------------------------------------------------------------- analysis
 class Selector:
-    def __init__(self, idx):
+    def __init__(self, idx, runtime_tests=None):
         self.idx = idx
-        self.ms = {n: ms for n, (tid, ms) in idx.tests.items()}
         self._src_cache = {}
+        self._old_lines = None
+        self._rel = None
+        # The index knows tests by the ids of the tree it was built from; the run's tests.json decides
+        # the numbers and durations to answer with. Unknown ids (none expected) are always included.
+        if runtime_tests is None:
+            runtime_tests = [{"number": n, "id": tid, "seconds": ms / 1000} for n, (tid, ms) in idx.tests.items()]
+        by_id = {t["id"]: t for t in runtime_tests}
+        self.ms = {t["number"]: round(t["seconds"] * 1000) for t in runtime_tests}
+        self.trans = {}
+        for n, (tid, ms) in idx.tests.items():
+            t = by_id.get(tid)
+            self.trans[n] = t["number"] if t else None
+        known_ids = {tid for (tid, ms) in idx.tests.values()}
+        self.always = sorted(t["number"] for t in runtime_tests if t["id"] not in known_ids)
+        if self.always:
+            log(f"{len(self.always)} tests in tests.json are unknown to the index; always selected")
+        missing = sum(1 for v in self.trans.values() if v is None)
+        if missing:
+            log(f"{missing} indexed tests are absent from tests.json")
 
     def read_old(self, rel):
         if rel in self._src_cache:
@@ -308,23 +408,74 @@ class Selector:
         kind = fe["kind"][L] if "kind" in fe and L < len(fe["kind"]) else K_NONE
         if kind in (K_NONE, K_DOC, K_TC):
             return 0
-        if kind in (K_DEF, K_FUNC):
+        if kind == K_DEF:
             return self.func_body_tests(fe, L)
+        text = self._old_lines[L - 1] if self._old_lines and L - 1 < len(self._old_lines) else ""
+        if STRUCTURAL.match(text):
+            # else/elif/except/finally/try/case and closing brackets carry no events of their own:
+            # whoever ran the enclosing compound statement can see a change here
+            comp = fe.get("compound", {}).get(L)
+            if comp is not None and lines:
+                for ln in range(comp[0], comp[1] + 1):
+                    sid = lines.get(ln)
+                    if sid is not None:
+                        m |= idx.m(sid)
+                if m:
+                    return m
+            return self.func_body_tests(fe, L) if kind == K_FUNC else idx.m(fe["importers"])
+        if kind == K_FUNC:
+            return 0  # an executable statement no test ever ran cannot change any test
         # module/class level line without coverage (dead branch at import) -> importers
         return idx.m(fe["importers"])
 
-    def class_attr_tests(self, fe, names, fallback):
-        """Tests that can observe a change to class attributes `names`: those that executed a line
-        reading one of the names, restricted to tests that loaded this module at all."""
-        if not names or not DEFUSE:
+    def class_attr_tests(self, fe, names, fallback, qual=None):
+        """Tests that can observe a change to a class-body line.
+
+        For classes whose instantiations were traced (Expression, Dialect, Parser, Generator, Tokenizer
+        families): tests that created the class or a subclass, and, when the line assigns attributes,
+        also executed a line reading one of those names; plus class-level reads qualified by the class
+        or a subclass, plus any read of the name inside a test file.
+        For other classes: tests that executed a reader line, among those that loaded the module."""
+        idx = self.idx
+        if not DEFUSE:
+            return fallback
+        if names:
+            # names resolved dynamically (sqlglot's `<key>_sql` dispatch, dunders) cannot be reasoned
+            # about: treat the line as a generic class-body change. Every other identifier's readers are
+            # indexed, so a name with no entry has no reader anywhere in the base tree.
+            if any(n.endswith("_sql") or n.startswith("__") for n in names):
+                names = None
+        if qual is not None and qual in idx.inst:
+            cand = idx.m(idx.inst[qual])
+            if names:
+                du = 0
+                for n in names:
+                    sid = idx.attr_uses.get(n)
+                    if sid is not None:
+                        du |= idx.m(sid)
+                cand &= du
+                classes = [qual] + list(idx.subs.get(qual, []))
+                simple = {c.rsplit(".", 1)[-1] for c in classes}
+                for n in names:
+                    for s in simple:
+                        sid = idx.quses.get((s, n))
+                        if sid is not None:
+                            cand |= idx.m(sid)
+                    sid = idx.test_uses.get(n)
+                    if sid is not None:
+                        cand |= idx.m(sid)
+            return cand
+        if not names:
             return fallback
         m = 0
         for n in names:
-            sid = self.idx.attr_uses.get(n)
-            if sid is None:
-                continue
-            m |= self.idx.m(sid)
-        return m & self.idx.m(fe["importers"])
+            sid = idx.attr_uses_all.get(n)
+            if sid is not None:
+                m |= idx.m(sid)
+            sid = idx.test_uses.get(n)
+            if sid is not None:
+                m |= idx.m(sid)
+        return m & idx.m(fe["importers"])
 
     def func_body_tests(self, fe, L):
         best = None
@@ -358,10 +509,16 @@ class Selector:
             # deleted or renamed: everything that imported, executed or read the old path
             if fe_old:
                 m |= idx.m(fe_old["importers"]) | idx.m(fe_old["any"]) | idx.m(fe_old["readers"])
-            m |= self.dir_tests(rel_old)
+            if not (rel_old.startswith("tests/") and rel_old.endswith(".py")):
+                m |= self.dir_tests(rel_old)  # (pytest lists tests/ for every test; a test module going away only hurts its own tests)
             if f["deleted"]:
                 return m
         if f["new_file"] or (fe_old is None and fe_new is None and not os.path.exists(os.path.join(REPO, rel))):
+            base = os.path.basename(rel)
+            if base == "conftest.py" or (base.endswith(".pth")):
+                return idx.all_mask  # a new pytest plugin affects every test
+            if rel.startswith("tests/") and rel.endswith(".py"):
+                return m  # a new test module holds no scored test and nothing imports it yet
             m |= self.dir_tests(rel)
             if rel.endswith(".py") and self.is_dialect_module(rel):
                 m |= self.dialect_enumeration_tests()
@@ -410,6 +567,8 @@ class Selector:
 
     def analyze_python(self, rel, fe, old_text, ap):
         idx = self.idx
+        self._rel = rel
+        self._old_lines = old_text.split("\n")
         new_text = "\n".join(ap.new_lines)
         try:
             tree = ast.parse(new_text)
@@ -417,22 +576,42 @@ class Selector:
             return idx.m(fe["importers"]) | idx.m(fe["any"])
         m = 0
         kind = fe.get("kind", b"")
+        skip_old, skip_new = self.equivalent_regions(fe, old_text, ap, tree)
         # removed / modified lines: what executed them in the base tree
         class_assign = fe.get("class_assign", {})
+        mod_assign = fe.get("mod_assign", {})
         for L in ap.removed:
+            if L in skip_old:
+                continue
             k = kind[L] if L < len(kind) else K_NONE
             if k in (K_NONE, K_DOC, K_TC):
                 continue
             t = self.tests_old_line(fe, L)
-            if k == K_CLASS and L in class_assign and (fe.get("lambdas", {}).get(L) is None or L == fe["lambdas"][L][0]):
-                t = self.class_attr_tests(fe, class_assign[L], t)
+            in_lambda_body = fe.get("lambdas", {}).get(L) is not None and L != fe["lambdas"][L][0]
+            if k == K_CLASS and not in_lambda_body:
+                t = self.class_attr_tests(fe, class_assign.get(L), t, fe.get("cls_lines", {}).get(L))
+            elif k == K_MODULE and not in_lambda_body and L in mod_assign:
+                t = self.class_attr_tests(fe, mod_assign[L], t, None)
+            elif k == K_DEF and L in mod_assign:
+                # header of a module-level function: callers, plus every `from m import f` site
+                t |= self.class_attr_tests(fe, mod_assign[L], 0, None)
             m |= t
         if not ap.added:
             return m
         nt = NewTree(tree, len(ap.new_lines))
         nt.module_doc(tree)
+        old_lines = self._old_lines
         for (N, anchors, prev_old) in ap.added:
-            text = ap.new_lines[N - 1].strip()
+            if N in skip_new:
+                continue
+            raw = ap.new_lines[N - 1]
+            text = raw.strip()
+            if anchors and text and not text.startswith("#"):
+                # in-place replacement at the same indentation: the statement sits where the removed one
+                # was, so the removed statement's tests (already counted) are exactly its reach
+                ind = len(raw) - len(raw.lstrip())
+                if any(len(old_lines[a - 1]) - len(old_lines[a - 1].lstrip()) == ind for a in anchors if a - 1 < len(old_lines)):
+                    continue
             if N in nt.doc_lines or N in nt.tc_lines:
                 continue
             if (not text or text.startswith("#")) and N not in nt.str_lines:
@@ -459,18 +638,67 @@ class Selector:
                 for o in mapped:
                     t |= self.tests_old_line(fe, o)
                 if rec["ctx"] == "class":
-                    t = self.class_attr_tests(fe, self.assign_names(rec["node"]), t)
+                    t = self.class_attr_tests(fe, self.assign_names(rec["node"]), t, self.full_qual(rel, rec["qual"]))
                 m |= t
                 continue
             # a genuinely new statement
             if rec["ctx"] == "class":
-                m |= self.class_attr_tests(fe, self.assign_names(rec["node"]), idx.m(fe["importers"]))
+                m |= self.class_attr_tests(fe, self.assign_names(rec["node"]), idx.m(fe["importers"]), self.full_qual(rel, rec["qual"]))
                 continue
             if rec["ctx"] == "module":
-                m |= idx.m(fe["importers"])
+                names = self.assign_names(rec["node"])
+                m |= self.class_attr_tests(fe, names, idx.m(fe["importers"]), None) if names else idx.m(fe["importers"])
                 continue
             m |= self.new_statement_tests(fe, nt, ap, rec)
         return m
+
+    def equivalent_regions(self, fe, old_text, ap, new_tree):
+        """Old/new line sets inside functions whose normalized ASTs are identical before and after the
+        patch: the patch cannot change their behavior, so their hunks are ignored. Only attempted for
+        small hunks whose text involves an identity/equality operator."""
+        if not EQUIV or len(ap.removed) + len(ap.added) > 6:
+            return set(), set()
+        changed_text = " ".join(ap.new_lines[n - 1] for n, _, _ in ap.added)
+        old_lines = old_text.split("\n")
+        changed_text += " " + " ".join(old_lines[L - 1] for L in ap.removed if L - 1 < len(old_lines))
+        if not any(tok in changed_text for tok in (" is ", "==", "!=", '"""', "'''")):
+            return set(), set()
+        try:
+            old_tree = ast.parse(old_text)
+        except (SyntaxError, ValueError):
+            return set(), set()
+        skip_old, skip_new = set(), set()
+        funcs = fe.get("funcs", [])
+        done = set()
+        for L in ap.removed:
+            best = None
+            for (s, e, bs, sid, name) in funcs:
+                if s <= L <= e and (best is None or (e - s) < (best[1] - best[0])):
+                    best = (s, e, name)
+            if best is None or best[2] in done:
+                continue
+            done.add(best[2])
+            of = find_func(old_tree, best[2])
+            nf = find_func(new_tree, best[2])
+            if of is None or nf is None:
+                continue
+            try:
+                if norm_dump(of, self.idx.plain_enums) == norm_dump(nf, self.idx.plain_enums):
+                    skip_old.update(range(of.lineno, of.end_lineno + 1))
+                    skip_new.update(range(nf.lineno, nf.end_lineno + 1))
+                    log(f"  equivalent after normalization: {best[2]}")
+            except RecursionError:
+                pass
+        return skip_old, skip_new
+
+    @staticmethod
+    def full_qual(rel, qual):
+        if not qual:
+            return None
+        parts = rel[:-3].split("/")
+        if parts[-1] == "__init__":
+            parts = parts[:-1]
+        return ".".join(parts) + "." + qual
 
     @staticmethod
     def assign_names(node):
@@ -478,6 +706,8 @@ class Selector:
             return [n.id for t in node.targets for n in ast.walk(t) if isinstance(n, ast.Name)]
         if isinstance(node, (ast.AnnAssign, ast.AugAssign)) and isinstance(node.target, ast.Name):
             return [node.target.id]
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)) and not node.decorator_list:
+            return [node.name]  # a plain def binds a name; decorators may have side effects
         return []
 
     def enclosing_new(self, fe, nt, N):
@@ -494,8 +724,15 @@ class Selector:
         f = rec["func"]
         of = self.old_func_by_name(fe, f[0]) if f else None
         if of is None:
-            # new function/method: it may override an inherited method, so whoever imports the module
-            return idx.m(fe["importers"])
+            # new function or method. A method may override an inherited one, so: instances of the
+            # class (traced) that read a name like it, else whoever imports the module. A plain
+            # module-level function only matters where its name is read.
+            qual = f[0]
+            name = qual.rsplit(".", 1)[-1]
+            if "." in qual:
+                owner_cls = qual.rsplit(".", 1)[0]
+                return self.class_attr_tests(fe, [name], idx.m(fe["importers"]), self.full_qual(self._rel, owner_cls))
+            return self.class_attr_tests(fe, [name], idx.m(fe["importers"]), None)
         # previous sibling that exists in the base tree
         block, i = rec["block"], rec["idx"]
         while i > 0:
@@ -506,15 +743,15 @@ class Selector:
             if o is not None:
                 return self.tests_old_line(fe, o)
             # the previous sibling is new too; keep walking back
-        owner = rec["owner"]
-        if owner is None or isinstance(owner, (ast.FunctionDef, ast.AsyncFunctionDef)):
+        hdr = rec.get("hdr")
+        if hdr is None:
             return idx.m(of[3])  # first statement of the function body: all its callers
-        # first statement of a compound block: whoever evaluated the block header
-        hdr = owner.lineno
-        # for else/except/finally bodies the header line is the compound statement's start; fine (superset)
+        # first statement of a compound block: whoever ran the block's header (if/for line, except line, ...)
         o = ap.new_to_old.get(hdr)
         if o is not None:
-            return self.tests_old_line(fe, o)
+            t = self.tests_old_line(fe, o)
+            if t:
+                return t
         return idx.m(of[3])
 
     # --- whole commit
@@ -537,16 +774,18 @@ class Selector:
 
     # --- packing
     def pack(self, mask):
-        if not mask:
-            return []
         ms = self.ms
-        tests = []
+        tests = list(self.always)
         n = 0
         while mask:
             if mask & 1:
-                tests.append(n)
+                r = self.trans.get(n)
+                if r is not None:
+                    tests.append(r)
             mask >>= 1
             n += 1
+        if not tests:
+            return []
         tests.sort(key=lambda t: -ms[t])
         best = None
         for k in range(1, min(MAX_WORKERS, len(tests)) + 1):
@@ -565,7 +804,13 @@ class Selector:
 def main():
     t0 = time.process_time()
     idx = Index(INDEX_PATH)
-    sel = Selector(idx)
+    try:
+        with open(os.path.join(DATA, "tests.json"), "rb") as f:
+            runtime_tests = json.load(f)["tests"]
+    except Exception as e:
+        log(f"tests.json unreadable ({e!r}); using the index's own test list")
+        runtime_tests = None
+    sel = Selector(idx, runtime_tests)
     t1 = time.process_time()
     commits_dir = os.path.join(DATA, "commits")
     names = sorted(n for n in os.listdir(commits_dir) if n.endswith(".patch"))
