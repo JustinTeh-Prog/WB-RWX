@@ -39,6 +39,9 @@ class Index:
         self.attr_uses = d.get("attr_uses", {})
         self.attr_uses_all = d.get("attr_uses_all", self.attr_uses)
         self.quses = d.get("quses", {})
+        self.quses_derived = d.get("quses_derived", {})
+        self.ambiguous = set(d.get("ambiguous_names", []))
+        self.expr_classes = d.get("expr_classes", {})
         self.test_uses = d.get("test_uses", {})
         self.inst = d.get("inst", {})
         self.subs = d.get("subs", {})
@@ -428,7 +431,7 @@ class Selector:
         # module/class level line without coverage (dead branch at import) -> importers
         return idx.m(fe["importers"])
 
-    def class_attr_tests(self, fe, names, fallback, qual=None):
+    def class_attr_tests(self, fe, names, fallback, qual=None, entry_classes=None):
         """Tests that can observe a change to a class-body line.
 
         For classes whose instantiations were traced (Expression, Dialect, Parser, Generator, Tokenizer
@@ -446,24 +449,44 @@ class Selector:
             if any(n.endswith("_sql") or n.startswith("__") for n in names):
                 names = None
         if qual is not None and qual in idx.inst:
-            cand = idx.m(idx.inst[qual])
+            inst = idx.m(idx.inst[qual])
+            cand = inst
             if names:
                 du = 0
                 for n in names:
                     sid = idx.attr_uses.get(n)
                     if sid is not None:
                         du |= idx.m(sid)
-                cand &= du
+                through_instances = inst & du
                 classes = [qual] + list(idx.subs.get(qual, []))
-                simple = {c.rsplit(".", 1)[-1] for c in classes}
+                simple = {c.rsplit(".", 1)[-1] for c in classes} - idx.ambiguous
+                direct = 0
                 for n in names:
                     for s in simple:
                         sid = idx.quses.get((s, n))
                         if sid is not None:
-                            cand |= idx.m(sid)
+                            direct |= idx.m(sid)  # class-level reads: anyone, at any time
+                        sid = idx.quses_derived.get((s, n))
+                        if sid is not None:
+                            through_instances |= idx.m(sid) & inst  # derived attributes are read through instances
                     sid = idx.test_uses.get(n)
                     if sid is not None:
-                        cand |= idx.m(sid)
+                        direct |= idx.m(sid)
+                if entry_classes:
+                    # the dict entry names Expression classes: an instance-side read can only reach this
+                    # entry in a test that built one of those classes
+                    ec = 0
+                    for s in entry_classes:
+                        q = idx.expr_classes.get(s)
+                        if q is None:
+                            ec = None  # not a (unique) Expression class: no conclusion
+                            break
+                        if q:
+                            ec |= idx.m(idx.inst[q])
+                        # q == "": an Expression class no test ever instantiated contributes nothing
+                    if ec is not None:
+                        through_instances &= ec
+                cand = through_instances | direct
             return cand
         if not names:
             return fallback
@@ -589,7 +612,8 @@ class Selector:
             t = self.tests_old_line(fe, L)
             in_lambda_body = fe.get("lambdas", {}).get(L) is not None and L != fe["lambdas"][L][0]
             if k == K_CLASS and not in_lambda_body:
-                t = self.class_attr_tests(fe, class_assign.get(L), t, fe.get("cls_lines", {}).get(L))
+                t = self.class_attr_tests(fe, class_assign.get(L), t, fe.get("cls_lines", {}).get(L),
+                                          fe.get("dict_entries", {}).get(L))
             elif k == K_MODULE and not in_lambda_body and L in mod_assign:
                 t = self.class_attr_tests(fe, mod_assign[L], t, None)
             elif k == K_DEF and L in mod_assign:

@@ -385,6 +385,12 @@ def main(labels_path, repo, out_path):
             else:
                 uses.setdefault(name, set()).add(loc)
 
+    def sum_masks(it):
+        mk = 0
+        for m in it:
+            mk |= m
+        return mk
+
     def line_mask(rel, ln):
         fe = files.get(rel)
         if not fe or "lines" not in fe:
@@ -424,14 +430,66 @@ def main(labels_path, repo, out_path):
         return mk
 
     attr_uses = {name: sets.add(expand(locs, {(name, None)})) for name, locs in uses.items()}
-    quses_idx = {(cls, name): sets.add(expand(locs, {(name, cls)})) for (cls, name), locs in quses.items()}
+    # class-qualified reads, split into direct reads (their own lines) and derivations (expanded to the
+    # derived attribute's readers, which the selector intersects with the class's instantiators)
+    quses_direct = {}
+    quses_derived = {}
+    for (cls, name), locs in quses.items():
+        direct = [loc for loc in locs if loc not in deriv]
+        derived = [loc for loc in locs if loc in deriv]
+        quses_direct[(cls, name)] = sets.add(expand(direct, {(name, cls)}))
+        quses_derived[(cls, name)] = sets.add(expand(derived, {(name, cls)}))
     attr_uses_all = {}
     for name in set(uses) | set(quses_by_name) | set(test_uses):
         attr_uses_all[name] = sets.add(expand(reads_of(name, None), {(name, None)}))
     for name in class_attr_names:
         attr_uses_all.setdefault(name, sets.add(0))  # tracked but never read: distinguishable from unknown
-    test_uses_idx = {name: sets.add(expand(locs, {(name, None)})) for name, locs in test_uses.items()}
+    # reads inside test files: their own lines only (a test reading X observes X there and then)
+    test_uses_idx = {name: sets.add(sum_masks(line_mask(*loc) for loc in locs)) for name, locs in test_uses.items()}
     print(f"derivation lines: {len(deriv)}")
+
+    # class names defined more than once (every dialect nests a Tokenizer, ...): a read qualified by such
+    # a simple name cannot be attributed to one class
+    from collections import Counter
+    name_counts = Counter()
+    for rel, tree in trees.items():
+        for node in ast.walk(tree):
+            if isinstance(node, ast.ClassDef):
+                name_counts[node.name] += 1
+    ambiguous_names = sorted(n for n, k in name_counts.items() if k > 1)
+
+    # dict entries in class bodies: Expression classes named by the entry (key or value). The entry can only
+    # matter to tests that instantiated one of those classes.
+    expr_classes = {}
+    for q in set():
+        pass
+    dict_entries = {}  # rel -> {line: [simple class names]}
+    for rel, tree in trees.items():
+        de = {}
+        for node in ast.walk(tree):
+            if not isinstance(node, ast.ClassDef):
+                continue
+            for st in node.body:
+                val = getattr(st, "value", None)
+                if not isinstance(st, (ast.Assign, ast.AnnAssign)) or not isinstance(val, ast.Dict):
+                    continue
+                for k, v in zip(val.keys, val.values):
+                    if k is None:
+                        continue  # **merge
+                    names_here = set()
+                    for sub in list(ast.walk(k)) + list(ast.walk(v)):
+                        if isinstance(sub, ast.Attribute):
+                            base = sub.value
+                            if isinstance(base, ast.Name) and base.id in ("exp", "expressions") and sub.attr[:1].isupper():
+                                names_here.add(sub.attr)
+                    if names_here:
+                        for ln in range(k.lineno, v.end_lineno + 1):
+                            de[ln] = sorted(names_here)
+        if de:
+            dict_entries[rel] = de
+    for rel, de in dict_entries.items():
+        if rel in files:
+            files[rel]["dict_entries"] = de
     for rel, cal in class_assign_lines.items():
         if rel in files:
             files[rel]["class_assign"] = cal
@@ -450,7 +508,37 @@ def main(labels_path, repo, out_path):
                 subs.setdefault(anc, set()).add(q)
     inst_idx = {q: sets.add(mk) for q, mk in inst.items()}
     subs_idx = {q: sorted(v) for q, v in subs.items()}
-    print(f"traced classes: {len(inst_idx)}; quses {len(quses_idx)}; test_uses {len(test_uses_idx)}")
+    # Expression subclasses, statically: classes in sqlglot/expressions whose bases chain to Expr/Expression.
+    # Value: the traced qualname when some test instantiated it, else "" (no test ever built one).
+    expr_defs = {}   # simple name -> list of base simple names
+    for rel, tree in trees.items():
+        if not rel.startswith("sqlglot/expressions/"):
+            continue
+        for node in ast.walk(tree):
+            if isinstance(node, ast.ClassDef):
+                bases = [b.id if isinstance(b, ast.Name) else (b.attr if isinstance(b, ast.Attribute) else "?") for b in node.bases]
+                expr_defs.setdefault(node.name, []).append(bases)
+    expr_set = {"Expr", "Expression"}
+    changed = True
+    while changed:
+        changed = False
+        for name, defs in expr_defs.items():
+            if name not in expr_set and any(b in expr_set for bases in defs for b in bases):
+                expr_set.add(name)
+                changed = True
+    expr_by_simple = {}
+    for q in inst:
+        if q.startswith("sqlglot.expressions."):
+            expr_by_simple.setdefault(q.rsplit(".", 1)[-1], []).append(q)
+    expr_classes = {}
+    for s in expr_set:
+        if len(expr_defs.get(s, [])) > 1:
+            continue  # defined twice: ambiguous
+        qs = expr_by_simple.get(s, [])
+        if len(qs) > 1:
+            continue
+        expr_classes[s] = qs[0] if qs else ""
+    print(f"traced classes: {len(inst_idx)}; quses {len(quses_direct)}; test_uses {len(test_uses_idx)}; expr classes {len(expr_classes)}")
 
     # ---- Enum classes: comparisons `x is E.M` and `x == E.M` are interchangeable for plain Enums
     # (identity-based __eq__), but not for str/int mixins. Keyed by simple name; ambiguous names are dropped.
@@ -476,7 +564,10 @@ def main(labels_path, repo, out_path):
         "plain_enums": plain_enums,
         "attr_uses": attr_uses,
         "attr_uses_all": attr_uses_all,
-        "quses": quses_idx,
+        "quses": quses_direct,
+        "quses_derived": quses_derived,
+        "ambiguous_names": ambiguous_names,
+        "expr_classes": expr_classes,
         "test_uses": test_uses_idx,
         "inst": inst_idx,
         "subs": subs_idx,
