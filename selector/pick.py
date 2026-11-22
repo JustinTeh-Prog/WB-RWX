@@ -20,6 +20,18 @@ WORKER_MS = 2000
 MAX_WORKERS = 8
 DEFUSE = os.environ.get("SEL_DEFUSE", "1") == "1"
 EQUIV = os.environ.get("SEL_EQUIV", "1") == "1"
+# Runtime execution of small candidate sets: the candidates are run (unittest, in a copy of the tree with the
+# patch applied) and only the tests that actually fail are selected. Sound by construction (a candidate set
+# is a superset of the failures either way); it only trades 2 s of worker overhead for a fraction of a second
+# of CPU. Off unless SEL_RUN=1 (the image sets it; the test environment must be installed).
+RUN_ENABLED = os.environ.get("SEL_RUN", "0") == "1"
+RUN_TREE = os.environ.get("SEL_RUN_TREE", "/tmp/tree")
+RUN_MAX_MS = int(os.environ.get("SEL_RUN_MAX_MS", "2500"))
+RUN_MAX_TESTS = int(os.environ.get("SEL_RUN_MAX_TESTS", "120"))
+RUN_BUDGET_S = float(os.environ.get("SEL_RUN_BUDGET_S", "150"))
+RUN_TIMEOUT_S = float(os.environ.get("SEL_RUN_TIMEOUT_S", "40"))
+UNRUNNABLE_FILES = {"tests/test_optimizer.py", "tests/test_executor.py", "tests/test_sqlglotc.py"}
+UNRUNNABLE_SUFFIXES = ("::test_generator_memory",)
 import re
 STRUCTURAL = re.compile(r"\s*(else\b|elif\b|except\b|finally\b|try\b|case\b|[)\]}]|with\b|for\b|while\b|if\b)")
 
@@ -350,12 +362,18 @@ class Selector:
         self._src_cache = {}
         self._old_lines = None
         self._rel = None
+        self._commit_files = {}
+        self._commit_unrunnable = False
+        self._tree_ready = None
+        self._run_spent = 0.0
+        self._wall0 = time.time()
         # The index knows tests by the ids of the tree it was built from; the run's tests.json decides
         # the numbers and durations to answer with. Unknown ids (none expected) are always included.
         if runtime_tests is None:
             runtime_tests = [{"number": n, "id": tid, "seconds": ms / 1000} for n, (tid, ms) in idx.tests.items()]
         by_id = {t["id"]: t for t in runtime_tests}
         self.ms = {t["number"]: round(t["seconds"] * 1000) for t in runtime_tests}
+        self.rt_ids = {t["number"]: t["id"] for t in runtime_tests}
         self.trans = {}
         for n, (tid, ms) in idx.tests.items():
             t = by_id.get(tid)
@@ -523,6 +541,8 @@ class Selector:
         fe_old = idx.files.get(rel_old) if rel_old else None
         fe_new = idx.files.get(rel_new) if rel_new else None
         m = 0
+        if f["binary"] or f["deleted"] or f["new_file"] or (rel_old and rel_new and rel_old != rel_new):
+            self._commit_unrunnable = True  # only in-place edits of existing files are executed
         if f["binary"]:
             for fe in (fe_old, fe_new):
                 if fe:
@@ -552,12 +572,15 @@ class Selector:
             return m
         old_text = self.read_old(rel_old or rel)
         if old_text is None:
+            self._commit_unrunnable = True
             return m | idx.m(fe["any"]) | idx.m(fe["importers"]) | idx.m(fe["readers"])
         try:
             ap = apply_hunks(old_text, f["hunks"])
         except Exception as e:  # patch does not apply cleanly against our tree: be conservative
             log(f"  apply failed for {rel}: {e}")
+            self._commit_unrunnable = True
             return m | idx.m(fe["any"]) | idx.m(fe["importers"]) | idx.m(fe["readers"])
+        self._commit_files[rel] = "\n".join(ap.new_lines)
         if rel.endswith(".py"):
             return m | self.analyze_python(rel, fe, old_text, ap)
         return m | self.analyze_data(rel, fe, old_text, ap)
@@ -784,8 +807,11 @@ class Selector:
 
     # --- whole commit
     def select(self, patch_text):
+        self._commit_files = {}
+        self._commit_unrunnable = False
         files = parse_patch(patch_text)
         if not files:
+            self._commit_unrunnable = True
             return self.idx.all_mask
         m = 0
         for f in files:
@@ -800,9 +826,8 @@ class Selector:
                     m |= self.idx.all_mask
         return m
 
-    # --- packing
-    def pack(self, mask):
-        ms = self.ms
+    # --- runtime execution of small candidate sets
+    def mask_to_runtime(self, mask):
         tests = list(self.always)
         n = 0
         while mask:
@@ -812,6 +837,98 @@ class Selector:
                     tests.append(r)
             mask >>= 1
             n += 1
+        return tests
+
+    def _prepare_tree(self):
+        if self._tree_ready is not None:
+            return self._tree_ready
+        import shutil
+        try:
+            t0 = time.time()
+            if os.path.isdir(RUN_TREE):
+                shutil.rmtree(RUN_TREE)
+            os.makedirs(RUN_TREE)
+            for d in ("sqlglot", "tests", "sqlglotc"):
+                src = os.path.join(REPO, d)
+                if os.path.isdir(src):
+                    shutil.copytree(src, os.path.join(RUN_TREE, d), ignore=shutil.ignore_patterns(".git"))
+            self._tree_ready = True
+            log(f"  prepared {RUN_TREE} in {time.time() - t0:.2f}s")
+        except Exception as e:
+            log(f"  cannot prepare run tree: {e!r}")
+            self._tree_ready = False
+        return self._tree_ready
+
+    def maybe_run(self, mask):
+        """Run the candidates when that is cheaper than selecting them; return the failing runtime test
+        numbers, or None to keep the static selection."""
+        if not RUN_ENABLED or self._commit_unrunnable or not self._commit_files:
+            return None
+        tests = self.mask_to_runtime(mask)
+        if not tests or len(tests) > RUN_MAX_TESTS:
+            return None
+        total = sum(self.ms[t] for t in tests)
+        if total > RUN_MAX_MS:
+            return None
+        ids = []
+        for t in tests:
+            tid = self.rt_ids.get(t)
+            if tid is None or tid.split("::")[0] in UNRUNNABLE_FILES or tid.endswith(UNRUNNABLE_SUFFIXES):
+                return None
+            ids.append(tid)
+        if self._run_spent > RUN_BUDGET_S or time.time() - self._wall0 > RUN_BUDGET_S + 20:
+            return None
+        if not self._prepare_tree():
+            return None
+        import shutil
+        import subprocess
+        written = []
+        try:
+            for rel, text in self._commit_files.items():
+                dst = os.path.join(RUN_TREE, rel)
+                os.makedirs(os.path.dirname(dst), exist_ok=True)
+                with open(dst, "w", encoding="utf-8", newline="") as fh:
+                    fh.write(text)
+                written.append(rel)
+            env = dict(os.environ)
+            env["PYTHONPATH"] = RUN_TREE
+            env["SKIP_INTEGRATION"] = "0"
+            env.pop("PYTHONDONTWRITEBYTECODE", None)
+            t0 = time.time()
+            p = subprocess.run([sys.executable, os.path.join(os.path.dirname(os.path.abspath(__file__)), "runner.py")],
+                               input=json.dumps(ids), capture_output=True, text=True, cwd=RUN_TREE, env=env,
+                               timeout=min(RUN_TIMEOUT_S, max(5.0, RUN_BUDGET_S - self._run_spent)))
+            self._run_spent += time.time() - t0
+            if p.returncode != 0:
+                log(f"  runner exit {p.returncode}: {p.stderr[-300:]!r}")
+                return None
+            failed = json.loads(p.stdout.strip().splitlines()[-1])
+            by_id = {self.rt_ids[t]: t for t in tests}
+            out = []
+            for fid in failed:
+                if fid not in by_id:
+                    return None  # unexpected id: keep the static selection
+                out.append(by_id[fid])
+            log(f"  ran {len(ids)} tests ({total / 1000:.2f}s recorded) in {time.time() - t0:.2f}s: {len(out)} failed")
+            return out
+        except Exception as e:
+            log(f"  run failed: {e!r}")
+            return None
+        finally:
+            for rel in written:
+                try:
+                    shutil.copy2(os.path.join(REPO, rel), os.path.join(RUN_TREE, rel))
+                except Exception as e:
+                    log(f"  restore failed for {rel}: {e!r}; disabling runs")
+                    self._tree_ready = False
+
+    # --- packing
+    def pack(self, mask):
+        return self.pack_list(self.mask_to_runtime(mask))
+
+    def pack_list(self, tests):
+        ms = self.ms
+        tests = list(tests)
         if not tests:
             return []
         tests.sort(key=lambda t: -ms[t])
@@ -849,7 +966,8 @@ def main():
             with open(os.path.join(commits_dir, name), "rb") as f:
                 text = f.read().decode("utf-8", errors="replace")
             mask = sel.select(text)
-            workers = sel.pack(mask)
+            ran = sel.maybe_run(mask)
+            workers = sel.pack_list(ran) if ran is not None else sel.pack(mask)
         except Exception as e:
             log(f"{cid}: fatal {e!r}; selecting everything")
             workers = sel.pack(idx.all_mask)
